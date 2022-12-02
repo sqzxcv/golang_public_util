@@ -1,4 +1,4 @@
-module golang_public_util
+module github.com/sqzxcv/golang_public_util
 
 go 1.14
 
