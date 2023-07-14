@@ -72,6 +72,15 @@ func Json2Map(content string) (result map[string]interface{}, err error) {
     return result, nil
 }
 
+func MapStr2JSONStr(value map[string]string) (string, error) {
+    data, err := json.Marshal(value)
+
+    if err != nil {
+        return "", err
+    }
+    return string(data), nil
+}
+
 func WriteToFile(content string, filepath string) error {
     err := ioutil.WriteFile(filepath, []byte(content), os.ModePerm)
     if err != nil {
