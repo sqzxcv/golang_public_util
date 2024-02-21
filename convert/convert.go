@@ -23,6 +23,16 @@ func String2Int64(intStr string) (int64Num int64) {
     return
 }
 
+func String2Int32(intStr string) (int64Num int64) {
+    intNum, err := strconv.Atoi(intStr)
+    if err != nil {
+        //fmt.Println("String2Int32 err:", err)
+        return 0
+    }
+    int64Num = int64(intNum)
+    return
+}
+
 // 字符串转Float64
 //    floatStr：小数点数字的字符串
 func String2Float64(floatStr string) (floatNum float64) {

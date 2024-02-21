@@ -7,6 +7,7 @@ import (
     "fmt"
     "github.com/go-redis/redis/v8"
     "go.mongodb.org/mongo-driver/mongo/options"
+    opt "github.com/qiniu/qmgo/options"
     "gorm.io/driver/mysql"
     "strings"
 
@@ -15,6 +16,7 @@ import (
     "github.com/qiniu/qmgo"
     "go.mongodb.org/mongo-driver/mongo"
     "gorm.io/gorm"
+    "go.mongodb.org/mongo-driver/event"
 )
 
 // MySqlConfig 系统配置
@@ -24,6 +26,7 @@ type MySqlConfig struct {
     DBAccount  string `mapstructure:"db_account"`
     DBPassword string `mapstructure:"db_password"`
     DBName     string `mapstructure:"db_name"`
+    DBLinkInfo string `mapstructure:"db_link_info"`
 }
 
 type RedisConfig struct {
@@ -41,6 +44,10 @@ type QmgoConfig struct {
     Path   string `mapstructure:"path" json:"path" yaml:"path"`          // 服务器地址
     Port   string `mapstructure:"port" json:"port" yaml:"port"`          //:端口
     DBName string `mapstructure:"db_name" json:"db_name" yaml:"db_name"` //:数据库名称
+    DBAccount  string `mapstructure:"db_account"`
+    DBPassword string `mapstructure:"db_password"`
+    AuthenticationDatabase string `mapstructure:"authentication_database"`
+    ShowDebug bool `mapstructure:"show_debug"`
 }
 
 type Mgr struct {
@@ -75,7 +82,11 @@ func NewDBMgr(mysqlConfig *MySqlConfig, redisConfig *RedisConfig, mongoConf *Mon
     dbmgr.QmgoConf = qmgoConf
 
     if dbmgr.MySqlConf != nil {
-        str := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?timeout=90s&parseTime=true", dbmgr.MySqlConf.DBAccount, dbmgr.MySqlConf.DBPassword, dbmgr.MySqlConf.DBHost, dbmgr.MySqlConf.DBPort, dbmgr.MySqlConf.DBName)
+        str := dbmgr.MySqlConf.DBLinkInfo
+        if len(str) == 0 {
+            str = fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?timeout=90s&parseTime=true", dbmgr.MySqlConf.DBAccount, dbmgr.MySqlConf.DBPassword, dbmgr.MySqlConf.DBHost, dbmgr.MySqlConf.DBPort, dbmgr.MySqlConf.DBName)
+        }
+
         db, err := gorm.Open(mysql.Open(str), &gorm.Config{})
 
         if err != nil {
@@ -121,8 +132,35 @@ func NewDBMgr(mysqlConfig *MySqlConfig, redisConfig *RedisConfig, mongoConf *Mon
     }
 
     if dbmgr.QmgoConf != nil {
+        monitor := &event.CommandMonitor{
+            Started: func(_ context.Context, e *event.CommandStartedEvent) {
+                glog.Debug(e.Command)
+            },
+            Succeeded: func(_ context.Context, e *event.CommandSucceededEvent) {
+                glog.Debug(e.Reply)
+            },
+            Failed: func(_ context.Context, e *event.CommandFailedEvent) {
+                glog.Error(e.Failure)
+            },
+        }
+
+        clientOptions := opt.ClientOptions{//<--注意：这个options.ClientOptions是qmgo自己封装的类型，里面继承了官方的
+            ClientOptions: &options.ClientOptions{//这个opt是mongoDrive官方的options，我给他起别名为opt
+                Monitor: monitor,
+            },
+        }
         ctx := context.Background()
-        client, err := qmgo.NewClient(ctx, &qmgo.Config{Uri: fmt.Sprintf("mongodb://%s:%s", dbmgr.QmgoConf.Path, dbmgr.QmgoConf.Port)})
+        uri := fmt.Sprintf("mongodb://%s:%s@%s:%s/%s", dbmgr.QmgoConf.DBAccount, dbmgr.QmgoConf.DBPassword, dbmgr.QmgoConf.Path, dbmgr.QmgoConf.Port, dbmgr.QmgoConf.DBName)
+        if len(dbmgr.QmgoConf.AuthenticationDatabase) != 0 {
+            uri = fmt.Sprintf("mongodb://%s:%s@%s:%s/%s?authSource=%s&authMechanism=SCRAM-SHA-1", dbmgr.QmgoConf.DBAccount, dbmgr.QmgoConf.DBPassword, dbmgr.QmgoConf.Path, dbmgr.QmgoConf.Port, dbmgr.QmgoConf.DBName, dbmgr.QmgoConf.AuthenticationDatabase)
+        }
+        cfg := &qmgo.Config{Uri: uri}
+        var client *qmgo.Client
+        if dbmgr.QmgoConf.ShowDebug {
+            client, err = qmgo.NewClient(ctx, cfg, clientOptions)
+        } else {
+            client, err = qmgo.NewClient(ctx, cfg)
+        }
         if err != nil {
             glog.Error("创建MongoDB 失败, 原因:", err)
             panic(err)
