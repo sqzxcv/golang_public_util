@@ -76,6 +76,7 @@ func (c *Client) ResetClient(ctx *gin.Context, conn *websocket.Conn, manager *Cl
 	//c.IsCompress = ctx.GetCompression()
 	//c.IsBackground = ctx.GetBackground()
 	//c.UserID = ctx.Get("userID").(string)
+	c.UserID = ctx.GetString("userID")
 	c.ctx = ctx
 	c.clientManager = manager
 	c.closed.Store(false)
@@ -100,7 +101,7 @@ func (c *Client) readMessage() {
 	defer func() {
 		if r := recover(); r != nil {
 			c.closedErr = ErrPanic
-			fmt.Println("socket have panic err:", r, string(debug.Stack()))
+			glog.Error("socket have panic err:", r, string(debug.Stack()))
 		}
 		c.close()
 	}()
@@ -118,7 +119,7 @@ func (c *Client) readMessage() {
 			return
 		}
 
-		glog.Debug("readMessage-", "messageType:", messageType)
+		//glog.Debug("readMessage-", "messageType:", messageType)
 		if c.closed.Load() {
 			// The scenario where the connection has just been closed, but the coroutine has not exited
 			c.closedErr = ErrConnClosed
@@ -169,9 +170,9 @@ func (c *Client) handleMessage(message []byte) error {
 		return err
 	}
 
-	if binaryReq.SendID != c.UserID {
-		return fmt.Errorf("exception conn userID not same to req userID", "binaryReq", binaryReq.String())
-	}
+	//if binaryReq.SendID != c.UserID {
+	//	return fmt.Errorf("exception conn userID not same to req userID", "binaryReq", binaryReq.String())
+	//}
 
 	glog.Debug("gateway req message", "req", binaryReq.String())
 
@@ -234,7 +235,7 @@ func (c *Client) replyMessage(binaryReq *Req, err error, resp []byte) error {
 
 func (c *Client) PushMessage(msgData []byte) error {
 
-	glog.Debug("PushMessage")
+	//glog.Debug("PushMessage")
 	resp := Resp{
 		ReqIdentifier: WSPushMsg,
 		Data:          string(msgData),

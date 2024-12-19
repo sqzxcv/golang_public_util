@@ -44,13 +44,13 @@ func (manager *ClientManager) Start() {
 	for {
 		select {
 		case client := <-manager.Register:
-			manager.Clients = make(map[*Client]bool)
 			manager.Clients[client] = true
 
 		case client := <-manager.Unregister:
 			if _, ok := manager.Clients[client]; ok {
 				delete(manager.Clients, client)
 			}
+			client.close()
 		case message := <-manager.Broadcast:
 			for client := range manager.Clients {
 				client.PushMessage(message)
@@ -99,10 +99,10 @@ func WsHandler(c *gin.Context) {
 //WSBroadcast 向客户端广播json消息.
 func WSBroadcast(message []byte) {
 
-	if len(Manager.Clients) == 0 {
-		glog.Info("WSBroadcast no client")
-		return
-	}
+	//if len(Manager.Clients) == 0 {
+	//	glog.Info("WSBroadcast no client")
+	//	return
+	//}
 	glog.Info("WSBroadcast hasClient:", len(Manager.Clients))
 	Manager.Broadcast <- message
 }
