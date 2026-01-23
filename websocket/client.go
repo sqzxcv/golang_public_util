@@ -18,13 +18,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/gin-gonic/gin"
-	"github.com/gorilla/websocket"
-	"github.com/sqzxcv/glog"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
+	"github.com/gofrs/uuid"
+	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
+	"github.com/sqzxcv/glog"
 )
 
 var (
@@ -57,30 +58,48 @@ type PingPongHandler func(string) error
 
 type Client struct {
 	w          *sync.Mutex
-	conn       *websocket.Conn
+	Conn       *websocket.Conn
 	PlatformID int `json:"platformID"`
 	//IsCompress   bool   `json:"isCompress"`
 	UserID        string `json:"userID"`
-	ctx           *gin.Context
+	Ctx           *gin.Context
 	clientManager *ClientManager
 	closed        atomic.Bool
 	closedErr     error
 	token         string
+	ID            string
+	sendCh        chan []byte // 带缓冲, 发送队列
+
 }
 
 // ResetClient updates the client's state with new connection and context information.
-func (c *Client) ResetClient(ctx *gin.Context, conn *websocket.Conn, manager *ClientManager) {
+func (c *Client) ResetClient(ctx *gin.Context, conn *websocket.Conn, manager *ClientManager, sessionID string) {
 	c.w = new(sync.Mutex)
-	c.conn = conn
+	c.Conn = conn
 	//c.PlatformID = stringutil.StringToInt(ctx.GetPlatformID())
 	//c.IsCompress = ctx.GetCompression()
 	//c.IsBackground = ctx.GetBackground()
 	//c.UserID = ctx.Get("userID").(string)
 	c.UserID = ctx.GetString("userID")
-	c.ctx = ctx
+	c.Ctx = ctx
 	c.clientManager = manager
 	c.closed.Store(false)
 	c.closedErr = nil
+	c.sendCh = make(chan []byte, 1024)
+	c.token = ""
+	// ID 改为uuid
+	id := ""
+	if sessionID == "" {
+		u4, err2 := uuid.NewV4()
+		if err2 != nil {
+			id = ctx.GetString("userID") + "_" + fmt.Sprintf("%d", time.Now().UnixNano())
+		} else {
+			id = u4.String()
+		}
+	} else {
+		id = sessionID
+	}
+	c.ID = id
 	//c.token = ctx.GetToken()
 }
 
@@ -89,7 +108,7 @@ func pongWaitTime() time.Time {
 }
 
 func (c *Client) pingHandler(_ string) error {
-	if err := c.conn.SetReadDeadline(pongWaitTime()); err != nil {
+	if err := c.Conn.SetReadDeadline(pongWaitTime()); err != nil {
 		return err
 	}
 
@@ -99,20 +118,21 @@ func (c *Client) pingHandler(_ string) error {
 // readMessage continuously reads messages from the connection.
 func (c *Client) readMessage() {
 	defer func() {
-		if r := recover(); r != nil {
+		if err := recover(); err != nil {
 			c.closedErr = ErrPanic
-			glog.Error("socket have panic err:", r, string(debug.Stack()))
+			glog.Error("socket have panic err:", err, string(debug.Stack()))
 		}
-		c.close()
+
+		c.close(c.closedErr)
 	}()
 
-	c.conn.SetReadLimit(maxMessageSize)
-	_ = c.conn.SetReadDeadline(pongWaitTime())
-	c.conn.SetPingHandler(c.pingHandler)
+	c.Conn.SetReadLimit(maxMessageSize)
+	_ = c.Conn.SetReadDeadline(pongWaitTime())
+	c.Conn.SetPingHandler(c.pingHandler)
 
 	for {
 		glog.Info("readMessage")
-		messageType, message, returnErr := c.conn.ReadMessage()
+		messageType, message, returnErr := c.Conn.ReadMessage()
 		if returnErr != nil {
 			glog.Warn("readMessage:", returnErr, "messageType:", messageType)
 			c.closedErr = returnErr
@@ -128,7 +148,7 @@ func (c *Client) readMessage() {
 
 		switch messageType {
 		case MessageBinary:
-			_ = c.conn.SetReadDeadline(pongWaitTime())
+			_ = c.Conn.SetReadDeadline(pongWaitTime())
 			parseDataErr := c.handleMessage(message)
 			if parseDataErr != nil {
 				c.closedErr = parseDataErr
@@ -137,7 +157,7 @@ func (c *Client) readMessage() {
 		case MessageText:
 			//c.closedErr = ErrNotSupportMessageProtocol
 			//return
-			_ = c.conn.SetReadDeadline(pongWaitTime())
+			_ = c.Conn.SetReadDeadline(pongWaitTime())
 			parseDataErr := c.handleMessage(message)
 			if parseDataErr != nil {
 				c.closedErr = parseDataErr
@@ -181,9 +201,15 @@ func (c *Client) handleMessage(message []byte) error {
 		messageErr error
 	)
 	if binaryReq.ReqIdentifier == WsHeartbeat {
-		resp, messageErr = c.handleHeartBeat(c.ctx, binaryReq)
-	} else {
-		resp, messageErr = BinaryMessageHandler(c, binaryReq)
+		resp, messageErr = c.handleHeartBeat(c.Ctx, binaryReq)
+	} else if binaryReq.ReqIdentifier == WSPushMsg {
+		if c.clientManager.PushMessageHandler != nil {
+			// 如果error 不为nil, 则将关闭socket
+			return c.clientManager.PushMessageHandler(c, binaryReq)
+		}
+		return nil
+	} else if c.clientManager.ReqResponseMessageHandler != nil {
+		resp, messageErr = c.clientManager.ReqResponseMessageHandler(c, binaryReq)
 	}
 
 	return c.replyMessage(binaryReq, messageErr, resp)
@@ -193,7 +219,7 @@ func (c *Client) handleHeartBeat(ctx context.Context, req *Req) ([]byte, error) 
 	return []byte(req.Data), nil
 }
 
-func (c *Client) close() {
+func (c *Client) close(err error) {
 	if c.closed.Load() {
 		return
 	}
@@ -201,8 +227,36 @@ func (c *Client) close() {
 	c.w.Lock()
 	defer c.w.Unlock()
 
+	if c.closed.Load() {
+		return
+	}
 	c.closed.Store(true)
-	c.conn.Close()
+
+	// 根据错误选择关闭码与理由
+	code := websocket.CloseNormalClosure // 1000
+	reason := ""
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrClientClosed):
+			code = websocket.CloseNormalClosure
+			reason = err.Error()
+		case errors.Is(err, ErrPanic):
+			code = websocket.CloseInternalServerErr // 1011
+			reason = err.Error()
+		default:
+			code = websocket.CloseInternalServerErr
+			reason = err.Error()
+		}
+	}
+
+	// 尝试发送 Close 控制帧（带 code/reason）
+	_ = c.Conn.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(code, reason),
+		time.Now().Add(time.Second),
+	)
+
+	_ = c.Conn.Close()
 	c.clientManager.UnRegister(c)
 }
 
@@ -243,6 +297,17 @@ func (c *Client) PushMessage(msgData []byte) error {
 	return c.writeBinaryMsg(resp)
 }
 
+func (c *Client) writePump() {
+	for msg := range c.sendCh {
+		c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		if err := c.Conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+			// 失败则触发注销
+			c.clientManager.Unregister <- c
+			return
+		}
+	}
+}
+
 func (c *Client) writeBinaryMsg(resp Resp) error {
 	if c.closed.Load() {
 		return nil
@@ -253,12 +318,12 @@ func (c *Client) writeBinaryMsg(resp Resp) error {
 	c.w.Lock()
 	defer c.w.Unlock()
 
-	err := c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+	err := c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
 	if err != nil {
 		return err
 	}
 
-	return c.conn.WriteMessage(MessageBinary, []byte(encodedBuf))
+	return c.Conn.WriteMessage(MessageBinary, []byte(encodedBuf))
 }
 
 func (c *Client) writePongMsg() error {
@@ -269,10 +334,10 @@ func (c *Client) writePongMsg() error {
 	c.w.Lock()
 	defer c.w.Unlock()
 
-	err := c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+	err := c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
 	if err != nil {
 		return err
 	}
 
-	return c.conn.WriteMessage(PongMessage, nil)
+	return c.Conn.WriteMessage(PongMessage, nil)
 }
