@@ -299,8 +299,13 @@ func (c *Client) PushMessage(msgData []byte) error {
 
 func (c *Client) writePump() {
 	for msg := range c.sendCh {
+		// 与 writeBinaryMsg/writePongMsg 共用同一把写锁,确保同一连接同一时刻只有一个写者
+		// (gorilla/websocket 要求),否则推送帧与心跳/pong 帧交错会损坏帧、导致前端心跳误判重连
+		c.w.Lock()
 		c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		if err := c.Conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+		err := c.Conn.WriteMessage(websocket.TextMessage, msg)
+		c.w.Unlock()
+		if err != nil {
 			// 失败则触发注销
 			c.clientManager.Unregister <- c
 			return
